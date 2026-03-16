@@ -208,7 +208,7 @@ fn v4l2_loop(config: V4l2Config, stop: Arc<AtomicBool>, tx: Sender<FrameImage>) 
     stream.set_timeout(Duration::from_secs(1));
 
     while !stop.load(Ordering::Relaxed) {
-        let (buf, _) = match stream.next() {
+        let (buf, meta) = match stream.next() {
             Ok(frame) => frame,
             Err(err)
                 if err.kind() == std::io::ErrorKind::TimedOut
@@ -219,7 +219,12 @@ fn v4l2_loop(config: V4l2Config, stop: Arc<AtomicBool>, tx: Sender<FrameImage>) 
             Err(err) => return Err(err).context("V4L2 frame capture failed"),
         };
 
-        let frame = decode_v4l2_frame(&actual, buf)?;
+        let bytes_used = usize::min(meta.bytesused as usize, buf.len());
+        if bytes_used == 0 {
+            continue;
+        }
+
+        let frame = decode_v4l2_frame(&actual, &buf[..bytes_used])?;
         let _ = tx.try_send(frame);
     }
 
@@ -255,7 +260,7 @@ fn decode_v4l2_frame(format: &Format, bytes: &[u8]) -> Result<FrameImage> {
         .map_err(|err| anyhow!("invalid V4L2 fourcc: {err}"))?;
 
     match fourcc {
-        "MJPG" => decode_jpeg(bytes),
+        "MJPG" => decode_mjpeg(bytes),
         "YUYV" => decode_yuyv(bytes, format.width as usize, format.height as usize),
         "BGR3" => decode_bgr3(bytes, format.width as usize, format.height as usize),
         other => bail!("unsupported V4L2 pixel format `{other}`"),
@@ -266,6 +271,21 @@ fn decode_v4l2_frame(format: &Format, bytes: &[u8]) -> Result<FrameImage> {
             fourcc, format.width, format.height, pixel_count
         )
     })
+}
+
+fn decode_mjpeg(bytes: &[u8]) -> Result<FrameImage> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        bail!("buffer does not start with JPEG SOI marker");
+    }
+
+    if bytes.ends_with(&[0xff, 0xd9]) {
+        return decode_jpeg(bytes);
+    }
+
+    let mut repaired = Vec::with_capacity(bytes.len() + 2);
+    repaired.extend_from_slice(bytes);
+    repaired.extend_from_slice(&[0xff, 0xd9]);
+    decode_jpeg(&repaired)
 }
 
 fn decode_bgr3(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> {

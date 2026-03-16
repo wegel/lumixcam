@@ -21,13 +21,15 @@ fn main() -> Result<()> {
     let camera = Arc::new(CameraClient::new(config.camera_ip.clone()));
     camera.initialize().context("failed to initialize camera")?;
 
-    if let VideoSourceConfig::LumixUdp { port } = config.video_source {
+    let initial_source = config.initial_source;
+    let initial_source_config = config.source_config(initial_source);
+    if let VideoSourceConfig::LumixUdp { port } = initial_source_config {
         camera
             .start_stream(port)
             .with_context(|| format!("failed to start Lumix UDP stream on port {port}"))?;
     }
 
-    let frame_source = RunningFrameSource::spawn(&config.video_source)
+    let frame_source = RunningFrameSource::spawn(&initial_source_config)
         .context("failed to start selected video source")?;
     let keepalive = KeepaliveHandle::spawn(Arc::clone(&camera));
     let command_worker = CameraCommandWorker::spawn(Arc::clone(&camera));
@@ -37,24 +39,48 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let title = format!("Lumix Control ({})", config.video_source.description());
-    let app = LumixApp::new(config, camera, frame_source, keepalive, command_worker);
+    let title = format!("Lumix Control ({})", initial_source_config.description());
+    let app = LumixApp::new(
+        config,
+        camera,
+        initial_source,
+        frame_source,
+        keepalive,
+        command_worker,
+    );
     eframe::run_native(&title, options, Box::new(move |_| Ok(Box::new(app))))
         .map_err(|err| anyhow!("failed to launch egui window: {err}"))?;
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceKind {
+    LumixUdp,
+    V4l2,
+}
+
+impl SourceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LumixUdp => "Lumix UDP",
+            Self::V4l2 => "V4L2",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AppConfig {
     camera_ip: String,
-    video_source: VideoSourceConfig,
+    initial_source: SourceKind,
+    lumix_udp_port: u16,
+    v4l2_config: V4l2Config,
 }
 
 impl AppConfig {
     fn parse() -> Result<Self> {
         let mut camera_ip = String::from("192.168.54.1");
         let mut source_name = String::from("lumix-udp");
-        let mut udp_port: u16 = 49_152;
+        let mut lumix_udp_port: u16 = 49_152;
         let mut video_device = String::from("/dev/video2");
         let mut video_size = String::from("1920x1080");
         let mut framerate: u32 = 60;
@@ -71,7 +97,7 @@ impl AppConfig {
                 }
                 "--udp-port" => {
                     let value = next_value(&mut args, "--udp-port")?;
-                    udp_port = value
+                    lumix_udp_port = value
                         .parse()
                         .with_context(|| format!("invalid UDP port `{value}`"))?;
                 }
@@ -98,26 +124,37 @@ impl AppConfig {
             }
         }
 
-        let video_source = match source_name.as_str() {
-            "lumix-udp" => VideoSourceConfig::LumixUdp { port: udp_port },
-            "v4l2" => {
-                let (width, height) = parse_video_size(&video_size)?;
-                let pixel_format = V4l2PixelFormat::parse(&input_format)?;
-                VideoSourceConfig::V4l2(V4l2Config {
-                    device: video_device,
-                    width,
-                    height,
-                    fps: framerate,
-                    pixel_format,
-                })
-            }
+        let initial_source = match source_name.as_str() {
+            "lumix-udp" => SourceKind::LumixUdp,
+            "v4l2" => SourceKind::V4l2,
             other => bail!("unsupported source `{other}`"),
+        };
+
+        let (width, height) = parse_video_size(&video_size)?;
+        let pixel_format = V4l2PixelFormat::parse(&input_format)?;
+        let v4l2_config = V4l2Config {
+            device: video_device,
+            width,
+            height,
+            fps: framerate,
+            pixel_format,
         };
 
         Ok(Self {
             camera_ip,
-            video_source,
+            initial_source,
+            lumix_udp_port,
+            v4l2_config,
         })
+    }
+
+    fn source_config(&self, source: SourceKind) -> VideoSourceConfig {
+        match source {
+            SourceKind::LumixUdp => VideoSourceConfig::LumixUdp {
+                port: self.lumix_udp_port,
+            },
+            SourceKind::V4l2 => VideoSourceConfig::V4l2(self.v4l2_config.clone()),
+        }
     }
 }
 
@@ -155,6 +192,7 @@ fn parse_video_size(value: &str) -> Result<(u32, u32)> {
 struct LumixApp {
     config: AppConfig,
     camera: Arc<CameraClient>,
+    active_source: SourceKind,
     frame_source: RunningFrameSource,
     keepalive: KeepaliveHandle,
     command_worker: CameraCommandWorker,
@@ -162,27 +200,22 @@ struct LumixApp {
     focus_mode_idx: usize,
     af_area_idx: usize,
     focus_uv: Option<[f32; 2]>,
-    status_line: String,
+    notice: Option<String>,
 }
 
 impl LumixApp {
     fn new(
         config: AppConfig,
         camera: Arc<CameraClient>,
+        active_source: SourceKind,
         frame_source: RunningFrameSource,
         keepalive: KeepaliveHandle,
         command_worker: CameraCommandWorker,
     ) -> Self {
-        let status_line = format!(
-            "{} | {} | source: {}",
-            FOCUS_MODES[0].label,
-            AF_AREA_MODES[0].label,
-            config.video_source.description()
-        );
-
         Self {
             config,
             camera,
+            active_source,
             frame_source,
             keepalive,
             command_worker,
@@ -190,7 +223,7 @@ impl LumixApp {
             focus_mode_idx: 0,
             af_area_idx: 0,
             focus_uv: None,
-            status_line,
+            notice: Some(format!("active source: {}", active_source.label())),
         }
     }
 
@@ -218,6 +251,14 @@ impl LumixApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        if ctx.input(|input| input.key_pressed(Key::Num1)) {
+            self.switch_source(SourceKind::LumixUdp);
+        }
+
+        if ctx.input(|input| input.key_pressed(Key::Num2)) {
+            self.switch_source(SourceKind::V4l2);
+        }
+
         if ctx.input(|input| input.key_pressed(Key::C)) {
             self.send_command(CameraCommand::Capture);
         }
@@ -226,14 +267,12 @@ impl LumixApp {
             self.focus_mode_idx = (self.focus_mode_idx + 1) % FOCUS_MODES.len();
             let mode = FOCUS_MODES[self.focus_mode_idx];
             self.send_command(CameraCommand::SetFocusMode(mode));
-            self.refresh_status();
         }
 
         if ctx.input(|input| input.key_pressed(Key::A)) {
             self.af_area_idx = (self.af_area_idx + 1) % AF_AREA_MODES.len();
             let mode = AF_AREA_MODES[self.af_area_idx];
             self.send_command(CameraCommand::SetAfAreaMode(mode));
-            self.refresh_status();
         }
 
         if ctx.input(|input| input.key_pressed(Key::O)) {
@@ -243,22 +282,101 @@ impl LumixApp {
 
     fn send_command(&mut self, command: CameraCommand) {
         if let Err(err) = self.command_worker.sender.send(command) {
-            self.status_line = format!("camera worker unavailable: {err}");
+            self.notice = Some(format!("camera worker unavailable: {err}"));
         }
     }
 
-    fn refresh_status(&mut self) {
-        self.status_line = format!(
+    fn switch_source(&mut self, source: SourceKind) {
+        if source == self.active_source {
+            return;
+        }
+
+        let next_config = self.config.source_config(source);
+        if let VideoSourceConfig::LumixUdp { port } = &next_config {
+            if let Err(err) = self.camera.start_stream(*port) {
+                self.notice = Some(format!("failed to start {}: {err:#}", source.label()));
+                return;
+            }
+        }
+
+        let next_frame_source = match RunningFrameSource::spawn(&next_config) {
+            Ok(source_handle) => source_handle,
+            Err(err) => {
+                if next_config.uses_lumix_stream() {
+                    self.camera.stop_stream();
+                }
+                self.notice = Some(format!("failed to switch to {}: {err:#}", source.label()));
+                return;
+            }
+        };
+
+        let previous_source = self.active_source;
+        let previous_config = self.config.source_config(previous_source);
+        let previous_frame_source = std::mem::replace(&mut self.frame_source, next_frame_source);
+
+        self.active_source = source;
+        self.texture = None;
+        self.focus_uv = None;
+        self.notice = Some(format!(
+            "switched from {} to {}",
+            previous_source.label(),
+            source.label()
+        ));
+
+        if previous_config.uses_lumix_stream() && !next_config.uses_lumix_stream() {
+            self.camera.stop_stream();
+        }
+
+        drop(previous_frame_source);
+    }
+
+    fn status_text(&self) -> String {
+        let mut text = format!(
             "{} | {} | source: {}",
             FOCUS_MODES[self.focus_mode_idx].label,
             AF_AREA_MODES[self.af_area_idx].label,
-            self.config.video_source.description()
+            self.config.source_config(self.active_source).description()
         );
+        if let Some(notice) = &self.notice {
+            text.push_str(" | ");
+            text.push_str(notice);
+        }
+        text
+    }
+
+    fn draw_source_selector(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("source_selector")
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Video source:");
+
+                    if ui
+                        .selectable_label(self.active_source == SourceKind::LumixUdp, "1 Lumix UDP")
+                        .clicked()
+                    {
+                        self.switch_source(SourceKind::LumixUdp);
+                    }
+
+                    if ui
+                        .selectable_label(self.active_source == SourceKind::V4l2, "2 V4L2")
+                        .clicked()
+                    {
+                        self.switch_source(SourceKind::V4l2);
+                    }
+
+                    ui.separator();
+                    ui.monospace(
+                        "keys: 1/2 switch, c capture, f focus, a AF area, o one-shot AF, q quit",
+                    );
+                });
+            });
     }
 
     fn draw_video(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
         let (response, painter) = ui.allocate_painter(available, Sense::click());
+        let status_text = self.status_text();
 
         if let Some(texture) = &self.texture {
             let texture_size = texture.size_vec2();
@@ -290,13 +408,16 @@ impl LumixApp {
                 draw_crosshair(&painter, point);
             }
 
-            draw_status_bar(&painter, image_rect, &self.status_line);
+            draw_status_bar(&painter, image_rect, &status_text);
         } else {
             painter.rect_filled(response.rect, 0.0, Color32::from_rgb(16, 16, 16));
             painter.text(
                 response.rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Waiting for video...",
+                format!(
+                    "Waiting for video from {}...",
+                    self.config.source_config(self.active_source).description()
+                ),
                 egui::FontId::proportional(28.0),
                 Color32::WHITE,
             );
@@ -328,6 +449,7 @@ impl eframe::App for LumixApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_texture(ctx);
         self.handle_keys(ctx);
+        self.draw_source_selector(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::BLACK))
@@ -340,7 +462,11 @@ impl eframe::App for LumixApp {
 
 impl Drop for LumixApp {
     fn drop(&mut self) {
-        if self.config.video_source.uses_lumix_stream() {
+        if self
+            .config
+            .source_config(self.active_source)
+            .uses_lumix_stream()
+        {
             self.camera.stop_stream();
         }
 
