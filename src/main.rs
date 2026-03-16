@@ -12,7 +12,9 @@ use eframe::egui::{
 };
 
 use crate::camera::{AF_AREA_MODES, CameraClient, CameraCommand, FOCUS_MODES, KeepaliveHandle};
-use crate::frame_source::{FrameImage, RunningFrameSource, VideoSourceConfig};
+use crate::frame_source::{
+    FrameImage, RunningFrameSource, V4l2Config, V4l2PixelFormat, VideoSourceConfig,
+};
 
 fn main() -> Result<()> {
     let config = AppConfig::parse()?;
@@ -54,6 +56,9 @@ impl AppConfig {
         let mut source_name = String::from("lumix-udp");
         let mut udp_port: u16 = 49_152;
         let mut video_device = String::from("/dev/video2");
+        let mut video_size = String::from("1920x1080");
+        let mut framerate: u32 = 60;
+        let mut input_format = String::from("mjpeg");
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -73,6 +78,18 @@ impl AppConfig {
                 "--video-device" => {
                     video_device = next_value(&mut args, "--video-device")?;
                 }
+                "--video-size" => {
+                    video_size = next_value(&mut args, "--video-size")?;
+                }
+                "--framerate" => {
+                    let value = next_value(&mut args, "--framerate")?;
+                    framerate = value
+                        .parse()
+                        .with_context(|| format!("invalid frame rate `{value}`"))?;
+                }
+                "--input-format" => {
+                    input_format = next_value(&mut args, "--input-format")?;
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -83,9 +100,17 @@ impl AppConfig {
 
         let video_source = match source_name.as_str() {
             "lumix-udp" => VideoSourceConfig::LumixUdp { port: udp_port },
-            "v4l2" => VideoSourceConfig::V4l2 {
-                device: video_device,
-            },
+            "v4l2" => {
+                let (width, height) = parse_video_size(&video_size)?;
+                let pixel_format = V4l2PixelFormat::parse(&input_format)?;
+                VideoSourceConfig::V4l2(V4l2Config {
+                    device: video_device,
+                    width,
+                    height,
+                    fps: framerate,
+                    pixel_format,
+                })
+            }
             other => bail!("unsupported source `{other}`"),
         };
 
@@ -109,6 +134,22 @@ fn print_help() {
     println!("  --source <name>         `lumix-udp` or `v4l2` (default: lumix-udp)");
     println!("  --udp-port <port>       Lumix UDP stream port (default: 49152)");
     println!("  --video-device <path>   V4L2 device path (default: /dev/video2)");
+    println!("  --input-format <fmt>    V4L2 input format: mjpeg, yuyv, bgr3 (default: mjpeg)");
+    println!("  --video-size <WxH>      V4L2 size (default: 1920x1080)");
+    println!("  --framerate <fps>       V4L2 capture rate (default: 60)");
+}
+
+fn parse_video_size(value: &str) -> Result<(u32, u32)> {
+    let Some((width, height)) = value.split_once('x') else {
+        bail!("invalid video size `{value}`; expected WIDTHxHEIGHT");
+    };
+    let width = width
+        .parse()
+        .with_context(|| format!("invalid width in video size `{value}`"))?;
+    let height = height
+        .parse()
+        .with_context(|| format!("invalid height in video size `{value}`"))?;
+    Ok((width, height))
 }
 
 struct LumixApp {

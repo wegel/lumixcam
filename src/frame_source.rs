@@ -4,21 +4,76 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use image::ImageFormat;
+use v4l::buffer::Type;
+use v4l::format::{Format, FourCC};
+use v4l::io::traits::CaptureStream;
+use v4l::prelude::{Device, MmapStream};
+use v4l::video::Capture;
 
 #[derive(Clone, Debug)]
 pub enum VideoSourceConfig {
     LumixUdp { port: u16 },
-    V4l2 { device: String },
+    V4l2(V4l2Config),
+}
+
+#[derive(Clone, Debug)]
+pub struct V4l2Config {
+    pub device: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub pixel_format: V4l2PixelFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum V4l2PixelFormat {
+    Mjpeg,
+    Yuyv,
+    Bgr3,
+}
+
+impl V4l2PixelFormat {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "mjpeg" | "mjpg" => Ok(Self::Mjpeg),
+            "yuyv" => Ok(Self::Yuyv),
+            "bgr3" | "bgr24" => Ok(Self::Bgr3),
+            other => bail!("unsupported V4L2 input format `{other}`"),
+        }
+    }
+
+    fn fourcc(self) -> FourCC {
+        match self {
+            Self::Mjpeg => FourCC::new(b"MJPG"),
+            Self::Yuyv => FourCC::new(b"YUYV"),
+            Self::Bgr3 => FourCC::new(b"BGR3"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mjpeg => "mjpeg",
+            Self::Yuyv => "yuyv",
+            Self::Bgr3 => "bgr3",
+        }
+    }
 }
 
 impl VideoSourceConfig {
     pub fn description(&self) -> String {
         match self {
             VideoSourceConfig::LumixUdp { port } => format!("Lumix UDP :{port}"),
-            VideoSourceConfig::V4l2 { device } => format!("V4L2 {device}"),
+            VideoSourceConfig::V4l2(config) => format!(
+                "V4L2 {} {} {}x{}@{}",
+                config.device,
+                config.pixel_format.label(),
+                config.width,
+                config.height,
+                config.fps
+            ),
         }
     }
 
@@ -51,10 +106,13 @@ impl RunningFrameSource {
                 let port = *port;
                 thread::spawn(move || lumix_udp_loop(port, stop_flag, tx))
             }
-            VideoSourceConfig::V4l2 { device } => {
-                bail!(
-                    "video source `v4l2` is not implemented yet for `{device}`; the app is structured to add it next"
-                );
+            VideoSourceConfig::V4l2(config) => {
+                let config = config.clone();
+                thread::spawn(move || {
+                    if let Err(err) = v4l2_loop(config, stop_flag, tx) {
+                        eprintln!("[stream] {err:#}");
+                    }
+                })
             }
         };
 
@@ -122,6 +180,52 @@ fn lumix_udp_loop(port: u16, stop: Arc<AtomicBool>, tx: Sender<FrameImage>) {
     }
 }
 
+fn v4l2_loop(config: V4l2Config, stop: Arc<AtomicBool>, tx: Sender<FrameImage>) -> Result<()> {
+    let dev = Device::with_path(&config.device)
+        .with_context(|| format!("failed to open V4L2 device `{}`", config.device))?;
+
+    let requested = Format::new(config.width, config.height, config.pixel_format.fourcc());
+    let actual = dev
+        .set_format(&requested)
+        .with_context(|| format!("failed to set V4L2 format on `{}`", config.device))?;
+
+    let params = v4l::video::capture::Parameters::with_fps(config.fps);
+    let actual_params = dev
+        .set_params(&params)
+        .with_context(|| format!("failed to set frame rate on `{}`", config.device))?;
+
+    eprintln!(
+        "[stream] V4L2 using {} {}x{} @ {}/{}s",
+        actual.fourcc.str()?,
+        actual.width,
+        actual.height,
+        actual_params.interval.numerator,
+        actual_params.interval.denominator,
+    );
+
+    let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 4)
+        .with_context(|| format!("failed to create MMAP stream for `{}`", config.device))?;
+    stream.set_timeout(Duration::from_secs(1));
+
+    while !stop.load(Ordering::Relaxed) {
+        let (buf, _) = match stream.next() {
+            Ok(frame) => frame,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err).context("V4L2 frame capture failed"),
+        };
+
+        let frame = decode_v4l2_frame(&actual, buf)?;
+        let _ = tx.try_send(frame);
+    }
+
+    Ok(())
+}
+
 fn extract_jpeg(data: &[u8]) -> Option<&[u8]> {
     if data.len() < 34 {
         return None;
@@ -141,4 +245,89 @@ fn decode_jpeg(bytes: &[u8]) -> Result<FrameImage> {
         height: rgba.height() as usize,
         rgba: rgba.into_raw(),
     })
+}
+
+fn decode_v4l2_frame(format: &Format, bytes: &[u8]) -> Result<FrameImage> {
+    let pixel_count = (format.width as usize) * (format.height as usize);
+    let fourcc = format
+        .fourcc
+        .str()
+        .map_err(|err| anyhow!("invalid V4L2 fourcc: {err}"))?;
+
+    match fourcc {
+        "MJPG" => decode_jpeg(bytes),
+        "YUYV" => decode_yuyv(bytes, format.width as usize, format.height as usize),
+        "BGR3" => decode_bgr3(bytes, format.width as usize, format.height as usize),
+        other => bail!("unsupported V4L2 pixel format `{other}`"),
+    }
+    .with_context(|| {
+        format!(
+            "failed to decode V4L2 frame as {} ({}x{}, {} pixels)",
+            fourcc, format.width, format.height, pixel_count
+        )
+    })
+}
+
+fn decode_bgr3(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> {
+    let expected = width * height * 3;
+    if bytes.len() < expected {
+        bail!(
+            "short BGR3 frame: expected at least {expected} bytes, got {}",
+            bytes.len()
+        );
+    }
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for pixel in bytes[..expected].chunks_exact(3) {
+        rgba.push(pixel[2]);
+        rgba.push(pixel[1]);
+        rgba.push(pixel[0]);
+        rgba.push(255);
+    }
+
+    Ok(FrameImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
+fn decode_yuyv(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> {
+    let expected = width * height * 2;
+    if bytes.len() < expected {
+        bail!(
+            "short YUYV frame: expected at least {expected} bytes, got {}",
+            bytes.len()
+        );
+    }
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for chunk in bytes[..expected].chunks_exact(4) {
+        let y0 = chunk[0] as f32;
+        let u = chunk[1] as f32 - 128.0;
+        let y1 = chunk[2] as f32;
+        let v = chunk[3] as f32 - 128.0;
+
+        push_yuv_pixel(&mut rgba, y0, u, v);
+        push_yuv_pixel(&mut rgba, y1, u, v);
+    }
+
+    Ok(FrameImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
+fn push_yuv_pixel(rgba: &mut Vec<u8>, y: f32, u: f32, v: f32) {
+    let r = (y + 1.402 * v).round().clamp(0.0, 255.0) as u8;
+    let g = (y - 0.344_136 * u - 0.714_136 * v)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    let b = (y + 1.772 * u).round().clamp(0.0, 255.0) as u8;
+
+    rgba.push(r);
+    rgba.push(g);
+    rgba.push(b);
+    rgba.push(255);
 }
