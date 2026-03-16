@@ -11,3 +11,9 @@ egui = "0.33"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 ureq = { version = "2.12", default-features = false }
 v4l = "0.14"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+debug = 1

@@ -76,10 +76,6 @@ impl VideoSourceConfig {
             ),
         }
     }
-
-    pub fn uses_lumix_stream(&self) -> bool {
-        matches!(self, VideoSourceConfig::LumixUdp { .. })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -89,8 +85,28 @@ pub struct FrameImage {
     pub rgba: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub enum FramePacket {
+    Jpeg(Vec<u8>),
+    Bgr3 {
+        width: usize,
+        height: usize,
+        bytes: Vec<u8>,
+    },
+    Yu12 {
+        width: usize,
+        height: usize,
+        bytes: Vec<u8>,
+    },
+    Yuyv {
+        width: usize,
+        height: usize,
+        bytes: Vec<u8>,
+    },
+}
+
 pub struct RunningFrameSource {
-    receiver: Receiver<FrameImage>,
+    receiver: Receiver<FramePacket>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -123,7 +139,7 @@ impl RunningFrameSource {
         })
     }
 
-    pub fn receiver(&self) -> &Receiver<FrameImage> {
+    pub fn receiver(&self) -> &Receiver<FramePacket> {
         &self.receiver
     }
 }
@@ -137,7 +153,7 @@ impl Drop for RunningFrameSource {
     }
 }
 
-fn lumix_udp_loop(port: u16, stop: Arc<AtomicBool>, tx: Sender<FrameImage>) {
+fn lumix_udp_loop(port: u16, stop: Arc<AtomicBool>, tx: Sender<FramePacket>) {
     let socket = match UdpSocket::bind(("0.0.0.0", port)) {
         Ok(socket) => socket,
         Err(err) => {
@@ -171,16 +187,11 @@ fn lumix_udp_loop(port: u16, stop: Arc<AtomicBool>, tx: Sender<FrameImage>) {
             continue;
         };
 
-        match decode_jpeg(jpeg) {
-            Ok(frame) => {
-                let _ = tx.try_send(frame);
-            }
-            Err(err) => eprintln!("[stream] JPEG decode failed: {err}"),
-        }
+        let _ = tx.try_send(FramePacket::Jpeg(jpeg.to_vec()));
     }
 }
 
-fn v4l2_loop(config: V4l2Config, stop: Arc<AtomicBool>, tx: Sender<FrameImage>) -> Result<()> {
+fn v4l2_loop(config: V4l2Config, stop: Arc<AtomicBool>, tx: Sender<FramePacket>) -> Result<()> {
     let dev = Device::with_path(&config.device)
         .with_context(|| format!("failed to open V4L2 device `{}`", config.device))?;
 
@@ -224,8 +235,8 @@ fn v4l2_loop(config: V4l2Config, stop: Arc<AtomicBool>, tx: Sender<FrameImage>) 
             continue;
         }
 
-        let frame = decode_v4l2_frame(&actual, &buf[..bytes_used])?;
-        let _ = tx.try_send(frame);
+        let packet = packet_from_v4l2_frame(&actual, &buf[..bytes_used])?;
+        let _ = tx.try_send(packet);
     }
 
     Ok(())
@@ -252,25 +263,63 @@ fn decode_jpeg(bytes: &[u8]) -> Result<FrameImage> {
     })
 }
 
-fn decode_v4l2_frame(format: &Format, bytes: &[u8]) -> Result<FrameImage> {
-    let pixel_count = (format.width as usize) * (format.height as usize);
+fn packet_from_v4l2_frame(format: &Format, bytes: &[u8]) -> Result<FramePacket> {
     let fourcc = format
         .fourcc
         .str()
         .map_err(|err| anyhow!("invalid V4L2 fourcc: {err}"))?;
+    let width = format.width as usize;
+    let height = format.height as usize;
 
     match fourcc {
-        "MJPG" => decode_mjpeg(bytes),
-        "YUYV" => decode_yuyv(bytes, format.width as usize, format.height as usize),
-        "BGR3" => decode_bgr3(bytes, format.width as usize, format.height as usize),
+        "MJPG" => {
+            validate_mjpeg(bytes)?;
+            Ok(FramePacket::Jpeg(bytes.to_vec()))
+        }
+        "YUYV" => {
+            let expected = width * height * 2;
+            if bytes.len() < expected {
+                bail!(
+                    "short YUYV frame: expected at least {expected} bytes, got {}",
+                    bytes.len()
+                );
+            }
+            Ok(FramePacket::Yuyv {
+                width,
+                height,
+                bytes: bytes[..expected].to_vec(),
+            })
+        }
+        "BGR3" => {
+            let expected = width * height * 3;
+            if bytes.len() < expected {
+                bail!(
+                    "short BGR3 frame: expected at least {expected} bytes, got {}",
+                    bytes.len()
+                );
+            }
+            Ok(FramePacket::Bgr3 {
+                width,
+                height,
+                bytes: bytes[..expected].to_vec(),
+            })
+        }
+        "YU12" => {
+            let expected = width * height * 3 / 2;
+            if bytes.len() < expected {
+                bail!(
+                    "short YU12 frame: expected at least {expected} bytes, got {}",
+                    bytes.len()
+                );
+            }
+            Ok(FramePacket::Yu12 {
+                width,
+                height,
+                bytes: bytes[..expected].to_vec(),
+            })
+        }
         other => bail!("unsupported V4L2 pixel format `{other}`"),
     }
-    .with_context(|| {
-        format!(
-            "failed to decode V4L2 frame as {} ({}x{}, {} pixels)",
-            fourcc, format.width, format.height, pixel_count
-        )
-    })
 }
 
 fn decode_mjpeg(bytes: &[u8]) -> Result<FrameImage> {
@@ -288,17 +337,30 @@ fn decode_mjpeg(bytes: &[u8]) -> Result<FrameImage> {
     decode_jpeg(&repaired)
 }
 
-fn decode_bgr3(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> {
-    let expected = width * height * 3;
-    if bytes.len() < expected {
-        bail!(
-            "short BGR3 frame: expected at least {expected} bytes, got {}",
-            bytes.len()
-        );
+pub fn decode_frame_packet(packet: FramePacket) -> Result<FrameImage> {
+    match packet {
+        FramePacket::Jpeg(bytes) => decode_mjpeg(&bytes),
+        FramePacket::Bgr3 {
+            width,
+            height,
+            bytes,
+        } => decode_bgr3(&bytes, width, height),
+        FramePacket::Yu12 {
+            width,
+            height,
+            bytes,
+        } => decode_yu12(&bytes, width, height),
+        FramePacket::Yuyv {
+            width,
+            height,
+            bytes,
+        } => decode_yuyv(&bytes, width, height),
     }
+}
 
+fn decode_bgr3(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> {
     let mut rgba = Vec::with_capacity(width * height * 4);
-    for pixel in bytes[..expected].chunks_exact(3) {
+    for pixel in bytes.chunks_exact(3) {
         rgba.push(pixel[2]);
         rgba.push(pixel[1]);
         rgba.push(pixel[0]);
@@ -313,16 +375,8 @@ fn decode_bgr3(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> 
 }
 
 fn decode_yuyv(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> {
-    let expected = width * height * 2;
-    if bytes.len() < expected {
-        bail!(
-            "short YUYV frame: expected at least {expected} bytes, got {}",
-            bytes.len()
-        );
-    }
-
     let mut rgba = Vec::with_capacity(width * height * 4);
-    for chunk in bytes[..expected].chunks_exact(4) {
+    for chunk in bytes.chunks_exact(4) {
         let y0 = chunk[0] as f32;
         let u = chunk[1] as f32 - 128.0;
         let y1 = chunk[2] as f32;
@@ -330,6 +384,44 @@ fn decode_yuyv(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> 
 
         push_yuv_pixel(&mut rgba, y0, u, v);
         push_yuv_pixel(&mut rgba, y1, u, v);
+    }
+
+    Ok(FrameImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
+fn decode_yu12(bytes: &[u8], width: usize, height: usize) -> Result<FrameImage> {
+    if width % 2 != 0 || height % 2 != 0 {
+        bail!("YU12 requires even dimensions, got {width}x{height}");
+    }
+
+    let y_plane_len = width * height;
+    let uv_plane_len = y_plane_len / 4;
+    let expected = y_plane_len + uv_plane_len * 2;
+    if bytes.len() < expected {
+        bail!(
+            "short YU12 frame: expected at least {expected} bytes, got {}",
+            bytes.len()
+        );
+    }
+
+    let y_plane = &bytes[..y_plane_len];
+    let u_plane = &bytes[y_plane_len..y_plane_len + uv_plane_len];
+    let v_plane = &bytes[y_plane_len + uv_plane_len..expected];
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let uv_row = (y / 2) * (width / 2);
+        for x in 0..width {
+            let y_value = y_plane[y * width + x] as f32;
+            let uv_index = uv_row + (x / 2);
+            let u = u_plane[uv_index] as f32 - 128.0;
+            let v = v_plane[uv_index] as f32 - 128.0;
+            push_yuv_pixel(&mut rgba, y_value, u, v);
+        }
     }
 
     Ok(FrameImage {
@@ -350,4 +442,11 @@ fn push_yuv_pixel(rgba: &mut Vec<u8>, y: f32, u: f32, v: f32) {
     rgba.push(g);
     rgba.push(b);
     rgba.push(255);
+}
+
+fn validate_mjpeg(bytes: &[u8]) -> Result<()> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        bail!("buffer does not start with JPEG SOI marker");
+    }
+    Ok(())
 }

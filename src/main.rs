@@ -13,7 +13,8 @@ use eframe::egui::{
 
 use crate::camera::{AF_AREA_MODES, CameraClient, CameraCommand, FOCUS_MODES, KeepaliveHandle};
 use crate::frame_source::{
-    FrameImage, RunningFrameSource, V4l2Config, V4l2PixelFormat, VideoSourceConfig,
+    FramePacket, RunningFrameSource, V4l2Config, V4l2PixelFormat, VideoSourceConfig,
+    decode_frame_packet,
 };
 
 fn main() -> Result<()> {
@@ -193,7 +194,9 @@ struct LumixApp {
     config: AppConfig,
     camera: Arc<CameraClient>,
     active_source: SourceKind,
-    frame_source: RunningFrameSource,
+    lumix_source: Option<RunningFrameSource>,
+    v4l2_source: Option<RunningFrameSource>,
+    lumix_stream_started: bool,
     keepalive: KeepaliveHandle,
     command_worker: CameraCommandWorker,
     texture: Option<TextureHandle>,
@@ -212,11 +215,18 @@ impl LumixApp {
         keepalive: KeepaliveHandle,
         command_worker: CameraCommandWorker,
     ) -> Self {
+        let (lumix_source, v4l2_source, lumix_stream_started) = match active_source {
+            SourceKind::LumixUdp => (Some(frame_source), None, true),
+            SourceKind::V4l2 => (None, Some(frame_source), false),
+        };
+
         Self {
             config,
             camera,
             active_source,
-            frame_source,
+            lumix_source,
+            v4l2_source,
+            lumix_stream_started,
             keepalive,
             command_worker,
             texture: None,
@@ -228,12 +238,19 @@ impl LumixApp {
     }
 
     fn update_texture(&mut self, ctx: &egui::Context) {
-        let mut newest: Option<FrameImage> = None;
-        while let Ok(frame) = self.frame_source.receiver().try_recv() {
+        let mut newest: Option<FramePacket> = None;
+        let Some(frame_source) = self.active_frame_source() else {
+            return;
+        };
+
+        while let Ok(frame) = frame_source.receiver().try_recv() {
             newest = Some(frame);
         }
 
-        let Some(frame) = newest else {
+        let Some(packet) = newest else {
+            return;
+        };
+        let Ok(frame) = decode_frame_packet(packet) else {
             return;
         };
 
@@ -291,29 +308,12 @@ impl LumixApp {
             return;
         }
 
-        let next_config = self.config.source_config(source);
-        if let VideoSourceConfig::LumixUdp { port } = &next_config {
-            if let Err(err) = self.camera.start_stream(*port) {
-                self.notice = Some(format!("failed to start {}: {err:#}", source.label()));
-                return;
-            }
+        if let Err(err) = self.ensure_source_started(source) {
+            self.notice = Some(format!("failed to switch to {}: {err:#}", source.label()));
+            return;
         }
 
-        let next_frame_source = match RunningFrameSource::spawn(&next_config) {
-            Ok(source_handle) => source_handle,
-            Err(err) => {
-                if next_config.uses_lumix_stream() {
-                    self.camera.stop_stream();
-                }
-                self.notice = Some(format!("failed to switch to {}: {err:#}", source.label()));
-                return;
-            }
-        };
-
         let previous_source = self.active_source;
-        let previous_config = self.config.source_config(previous_source);
-        let previous_frame_source = std::mem::replace(&mut self.frame_source, next_frame_source);
-
         self.active_source = source;
         self.texture = None;
         self.focus_uv = None;
@@ -322,12 +322,6 @@ impl LumixApp {
             previous_source.label(),
             source.label()
         ));
-
-        if previous_config.uses_lumix_stream() && !next_config.uses_lumix_stream() {
-            self.camera.stop_stream();
-        }
-
-        drop(previous_frame_source);
     }
 
     fn status_text(&self) -> String {
@@ -443,6 +437,48 @@ impl LumixApp {
         };
         self.send_command(command);
     }
+
+    fn active_frame_source(&self) -> Option<&RunningFrameSource> {
+        match self.active_source {
+            SourceKind::LumixUdp => self.lumix_source.as_ref(),
+            SourceKind::V4l2 => self.v4l2_source.as_ref(),
+        }
+    }
+
+    fn ensure_source_started(&mut self, source: SourceKind) -> Result<()> {
+        match source {
+            SourceKind::LumixUdp => {
+                if self.lumix_source.is_none() {
+                    if !self.lumix_stream_started {
+                        let VideoSourceConfig::LumixUdp { port } =
+                            self.config.source_config(SourceKind::LumixUdp)
+                        else {
+                            unreachable!();
+                        };
+                        self.camera.start_stream(port).with_context(|| {
+                            format!("failed to start Lumix UDP stream on port {port}")
+                        })?;
+                        self.lumix_stream_started = true;
+                    }
+
+                    let source_handle =
+                        RunningFrameSource::spawn(&self.config.source_config(SourceKind::LumixUdp))
+                            .context("failed to start Lumix UDP frame source")?;
+                    self.lumix_source = Some(source_handle);
+                }
+            }
+            SourceKind::V4l2 => {
+                if self.v4l2_source.is_none() {
+                    let source_handle =
+                        RunningFrameSource::spawn(&self.config.source_config(SourceKind::V4l2))
+                            .context("failed to start V4L2 frame source")?;
+                    self.v4l2_source = Some(source_handle);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl eframe::App for LumixApp {
@@ -462,16 +498,13 @@ impl eframe::App for LumixApp {
 
 impl Drop for LumixApp {
     fn drop(&mut self) {
-        if self
-            .config
-            .source_config(self.active_source)
-            .uses_lumix_stream()
-        {
+        if self.lumix_stream_started {
             self.camera.stop_stream();
         }
 
         let _ = &self.keepalive;
-        let _ = &self.frame_source;
+        let _ = &self.lumix_source;
+        let _ = &self.v4l2_source;
         let _ = &self.command_worker;
     }
 }
