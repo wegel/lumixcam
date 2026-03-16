@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use crossbeam_channel::{Receiver, unbounded};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModeOption {
@@ -54,6 +55,34 @@ pub const AF_AREA_MODES: [ModeOption; 6] = [
         label: "49-Area",
     },
 ];
+
+#[derive(Clone, Debug, Default)]
+pub struct CameraState {
+    pub battery: Option<String>,
+    pub battery_grip: Option<String>,
+}
+
+impl CameraState {
+    pub fn summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+
+        if let Some(battery) = self.battery.as_deref() {
+            parts.push(format!("battery {battery}"));
+        }
+
+        if let Some(grip) = self.battery_grip.as_deref() {
+            if grip != "-1/0" {
+                parts.push(format!("grip {grip}"));
+            }
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" | "))
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CameraClient {
@@ -126,8 +155,12 @@ impl CameraClient {
         self.capture()
     }
 
-    pub fn get_state(&self) -> Result<()> {
-        self.request("mode=getstate").map(|_| ())
+    pub fn get_state(&self) -> Result<CameraState> {
+        let body = self.request("mode=getstate")?;
+        Ok(CameraState {
+            battery: extract_tag(&body, "batt"),
+            battery_grip: extract_tag(&body, "batt_grip"),
+        })
     }
 
     fn request(&self, params: &str) -> Result<String> {
@@ -150,6 +183,19 @@ fn ensure_ok(op: &str, body: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("{op} failed: {}", body.trim()))
+    }
+}
+
+fn extract_tag(body: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let (_, remainder) = body.split_once(&open)?;
+    let (value, _) = remainder.split_once(&close)?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
     }
 }
 
@@ -181,16 +227,21 @@ impl fmt::Display for CameraCommand {
 pub struct KeepaliveHandle {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    receiver: Receiver<CameraState>,
 }
 
 impl KeepaliveHandle {
     pub fn spawn(camera: Arc<CameraClient>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let (sender, receiver) = unbounded();
         let join = thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
-                if let Err(err) = camera.get_state() {
-                    eprintln!("[keepalive] {err}");
+                match camera.get_state() {
+                    Ok(state) => {
+                        let _ = sender.send(state);
+                    }
+                    Err(err) => eprintln!("[keepalive] {err}"),
                 }
                 for _ in 0..40 {
                     if stop_flag.load(Ordering::Relaxed) {
@@ -203,7 +254,12 @@ impl KeepaliveHandle {
         Self {
             stop,
             join: Some(join),
+            receiver,
         }
+    }
+
+    pub fn receiver(&self) -> &Receiver<CameraState> {
+        &self.receiver
     }
 }
 

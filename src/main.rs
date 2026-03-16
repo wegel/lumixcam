@@ -11,7 +11,9 @@ use eframe::egui::{
     self, Color32, ColorImage, Key, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 
-use crate::camera::{AF_AREA_MODES, CameraClient, CameraCommand, FOCUS_MODES, KeepaliveHandle};
+use crate::camera::{
+    AF_AREA_MODES, CameraClient, CameraCommand, CameraState, FOCUS_MODES, KeepaliveHandle,
+};
 use crate::frame_source::{
     FramePacket, RunningFrameSource, V4l2Config, V4l2PixelFormat, VideoSourceConfig,
     decode_frame_packet,
@@ -202,6 +204,7 @@ struct LumixApp {
     texture: Option<TextureHandle>,
     focus_mode_idx: usize,
     af_area_idx: usize,
+    camera_state: CameraState,
     focus_uv: Option<[f32; 2]>,
     notice: Option<String>,
 }
@@ -232,6 +235,7 @@ impl LumixApp {
             texture: None,
             focus_mode_idx: 0,
             af_area_idx: 0,
+            camera_state: CameraState::default(),
             focus_uv: None,
             notice: Some(format!("active source: {}", active_source.label())),
         }
@@ -260,6 +264,12 @@ impl LumixApp {
             None => {
                 self.texture = Some(ctx.load_texture("lumix-frame", image, TextureOptions::LINEAR));
             }
+        }
+    }
+
+    fn update_camera_state(&mut self) {
+        while let Ok(state) = self.keepalive.receiver().try_recv() {
+            self.camera_state = state;
         }
     }
 
@@ -331,6 +341,10 @@ impl LumixApp {
             AF_AREA_MODES[self.af_area_idx].label,
             self.config.source_config(self.active_source).description()
         );
+        if let Some(battery) = self.camera_state.summary() {
+            text.push_str(" | ");
+            text.push_str(&battery);
+        }
         if let Some(notice) = &self.notice {
             text.push_str(" | ");
             text.push_str(notice);
@@ -483,6 +497,7 @@ impl LumixApp {
 
 impl eframe::App for LumixApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.update_camera_state();
         self.update_texture(ctx);
         self.handle_keys(ctx);
         self.draw_source_selector(ctx);
