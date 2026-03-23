@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let title = format!("Lumix Control ({})", initial_source_config.description());
+    let title = format!("LumixCam ({})", initial_source_config.description());
     let app = LumixApp::new(
         config,
         camera,
@@ -167,7 +167,7 @@ fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Str
 }
 
 fn print_help() {
-    println!("Usage: cargo run -- [options]");
+    println!("Usage: lumixcam [options]");
     println!();
     println!("Options:");
     println!("  --camera-ip <ip>        Camera IP address (default: 192.168.54.1)");
