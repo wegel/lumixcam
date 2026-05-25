@@ -22,7 +22,14 @@ use crate::frame_source::{
 fn main() -> Result<()> {
     let config = AppConfig::parse()?;
     let camera = Arc::new(CameraClient::new(config.camera_ip.clone()));
-    camera.initialize().context("failed to initialize camera")?;
+
+    if let Some(timeout) = config.wait_camera {
+        camera
+            .initialize_until_ready(timeout)
+            .context("failed to initialize camera")?;
+    } else {
+        camera.initialize().context("failed to initialize camera")?;
+    }
 
     let initial_source = config.initial_source;
     let initial_source_config = config.source_config(initial_source);
@@ -74,6 +81,7 @@ impl SourceKind {
 #[derive(Clone, Debug)]
 struct AppConfig {
     camera_ip: String,
+    wait_camera: Option<Duration>,
     initial_source: SourceKind,
     lumix_udp_port: u16,
     v4l2_config: V4l2Config,
@@ -82,6 +90,7 @@ struct AppConfig {
 impl AppConfig {
     fn parse() -> Result<Self> {
         let mut camera_ip = String::from("192.168.54.1");
+        let mut wait_camera = Some(Duration::from_secs(60));
         let mut source_name = String::from("lumix-udp");
         let mut lumix_udp_port: u16 = 49_152;
         let mut video_device = String::from("/dev/video2");
@@ -94,6 +103,16 @@ impl AppConfig {
             match arg.as_str() {
                 "--camera-ip" => {
                     camera_ip = next_value(&mut args, "--camera-ip")?;
+                }
+                "--wait-camera" => {
+                    let value = next_value(&mut args, "--wait-camera")?;
+                    let seconds = value
+                        .parse()
+                        .with_context(|| format!("invalid camera wait seconds `{value}`"))?;
+                    wait_camera = Some(Duration::from_secs(seconds));
+                }
+                "--no-wait-camera" => {
+                    wait_camera = None;
                 }
                 "--source" => {
                     source_name = next_value(&mut args, "--source")?;
@@ -146,6 +165,7 @@ impl AppConfig {
         Ok(Self {
             camera_ip,
             initial_source,
+            wait_camera,
             lumix_udp_port,
             v4l2_config,
         })
@@ -172,6 +192,8 @@ fn print_help() {
     println!("Options:");
     println!("  --camera-ip <ip>        Camera IP address (default: 192.168.54.1)");
     println!("  --source <name>         `lumix-udp` or `v4l2` (default: lumix-udp)");
+    println!("  --wait-camera <secs>    Retry camera startup for this many seconds (default: 60)");
+    println!("  --no-wait-camera        Start without retrying camera startup");
     println!("  --udp-port <port>       Lumix UDP stream port (default: 49152)");
     println!("  --video-device <path>   V4L2 device path (default: /dev/video2)");
     println!("  --input-format <fmt>    V4L2 input format: mjpeg, yuyv, bgr3 (default: mjpeg)");

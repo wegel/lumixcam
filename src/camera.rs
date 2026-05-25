@@ -3,9 +3,9 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, unbounded};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +92,31 @@ pub struct CameraClient {
 impl CameraClient {
     pub fn new(ip: impl Into<String>) -> Self {
         Self { ip: ip.into() }
+    }
+
+    pub fn initialize_until_ready(&self, timeout: Duration) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            let message = match self.initialize() {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    eprintln!("[camera] waiting for camera startup: {message}");
+                    message
+                }
+            };
+
+            if start.elapsed() >= timeout {
+                bail!(
+                    "camera at {} did not complete startup within {} seconds; last error: {}",
+                    self.ip,
+                    timeout.as_secs(),
+                    message
+                );
+            }
+
+            thread::sleep(Duration::from_millis(500));
+        }
     }
 
     pub fn initialize(&self) -> Result<()> {

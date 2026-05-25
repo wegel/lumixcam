@@ -68,6 +68,8 @@ lumixcam --source v4l2 --video-device /dev/video0 \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--camera-ip <ip>` | `192.168.54.1` | Camera IP address |
+| `--wait-camera <secs>` | `60` | Retry camera startup for this many seconds |
+| `--no-wait-camera` | | Start without retrying camera startup |
 | `--source <name>` | `lumix-udp` | `lumix-udp` or `v4l2` |
 | `--udp-port <port>` | `49152` | UDP port for the Lumix video stream |
 | `--video-device <path>` | `/dev/video2` | V4L2 device path |
