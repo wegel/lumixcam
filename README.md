@@ -73,7 +73,7 @@ lumixcam --source v4l2 --video-device /dev/video0 \
 | `--source <name>` | `lumix-udp` | `lumix-udp` or `v4l2` |
 | `--udp-port <port>` | `49152` | UDP port for the Lumix video stream |
 | `--video-device <path>` | `/dev/video2` | V4L2 device path |
-| `--input-format <fmt>` | `mjpeg` | V4L2 pixel format: `mjpeg`, `yuyv`, `bgr3` |
+| `--input-format <fmt>` | `mjpeg` | V4L2 pixel format: `mjpeg`, `yuyv`, `bgr3`, `yu12` |
 | `--video-size <WxH>` | `1920x1080` | V4L2 capture resolution |
 | `--framerate <fps>` | `60` | V4L2 capture frame rate |
 

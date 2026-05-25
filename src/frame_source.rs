@@ -33,6 +33,7 @@ pub enum V4l2PixelFormat {
     Mjpeg,
     Yuyv,
     Bgr3,
+    Yu12,
 }
 
 impl V4l2PixelFormat {
@@ -41,6 +42,7 @@ impl V4l2PixelFormat {
             "mjpeg" | "mjpg" => Ok(Self::Mjpeg),
             "yuyv" => Ok(Self::Yuyv),
             "bgr3" | "bgr24" => Ok(Self::Bgr3),
+            "yu12" | "yuv420p" => Ok(Self::Yu12),
             other => bail!("unsupported V4L2 input format `{other}`"),
         }
     }
@@ -50,6 +52,7 @@ impl V4l2PixelFormat {
             Self::Mjpeg => FourCC::new(b"MJPG"),
             Self::Yuyv => FourCC::new(b"YUYV"),
             Self::Bgr3 => FourCC::new(b"BGR3"),
+            Self::Yu12 => FourCC::new(b"YU12"),
         }
     }
 
@@ -58,6 +61,7 @@ impl V4l2PixelFormat {
             Self::Mjpeg => "mjpeg",
             Self::Yuyv => "yuyv",
             Self::Bgr3 => "bgr3",
+            Self::Yu12 => "yu12",
         }
     }
 }
@@ -88,6 +92,7 @@ pub struct FrameImage {
 #[derive(Clone, Debug)]
 pub enum FramePacket {
     Jpeg(Vec<u8>),
+    Error(String),
     Bgr3 {
         width: usize,
         height: usize,
@@ -125,7 +130,9 @@ impl RunningFrameSource {
             VideoSourceConfig::V4l2(config) => {
                 let config = config.clone();
                 thread::spawn(move || {
+                    let error_tx = tx.clone();
                     if let Err(err) = v4l2_loop(config, stop_flag, tx) {
+                        let _ = error_tx.try_send(FramePacket::Error(format!("{err:#}")));
                         eprintln!("[stream] {err:#}");
                     }
                 })
@@ -340,6 +347,7 @@ fn decode_mjpeg(bytes: &[u8]) -> Result<FrameImage> {
 pub fn decode_frame_packet(packet: FramePacket) -> Result<FrameImage> {
     match packet {
         FramePacket::Jpeg(bytes) => decode_mjpeg(&bytes),
+        FramePacket::Error(message) => bail!("{message}"),
         FramePacket::Bgr3 {
             width,
             height,

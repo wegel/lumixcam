@@ -196,7 +196,9 @@ fn print_help() {
     println!("  --no-wait-camera        Start without retrying camera startup");
     println!("  --udp-port <port>       Lumix UDP stream port (default: 49152)");
     println!("  --video-device <path>   V4L2 device path (default: /dev/video2)");
-    println!("  --input-format <fmt>    V4L2 input format: mjpeg, yuyv, bgr3 (default: mjpeg)");
+    println!(
+        "  --input-format <fmt>    V4L2 input format: mjpeg, yuyv, bgr3, yu12 (default: mjpeg)"
+    );
     println!("  --video-size <WxH>      V4L2 size (default: 1920x1080)");
     println!("  --framerate <fps>       V4L2 capture rate (default: 60)");
 }
@@ -268,17 +270,37 @@ impl LumixApp {
         let Some(frame_source) = self.active_frame_source() else {
             return;
         };
+        let receiver = frame_source.receiver().clone();
 
-        while let Ok(frame) = frame_source.receiver().try_recv() {
-            newest = Some(frame);
+        while let Ok(frame) = receiver.try_recv() {
+            match frame {
+                FramePacket::Error(message) => {
+                    self.notice = Some(format!("video source error: {message}"));
+                }
+                frame => {
+                    newest = Some(frame);
+                }
+            }
         }
 
         let Some(packet) = newest else {
             return;
         };
-        let Ok(frame) = decode_frame_packet(packet) else {
-            return;
+        let frame = match decode_frame_packet(packet) {
+            Ok(frame) => frame,
+            Err(err) => {
+                self.notice = Some(format!("video decode error: {err:#}"));
+                return;
+            }
         };
+
+        if self
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.starts_with("video "))
+        {
+            self.notice = None;
+        }
 
         let image = ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
         match &mut self.texture {
@@ -441,13 +463,18 @@ impl LumixApp {
             draw_status_bar(&painter, image_rect, &status_text);
         } else {
             painter.rect_filled(response.rect, 0.0, Color32::from_rgb(16, 16, 16));
+            let mut message = format!(
+                "Waiting for video from {}...",
+                self.config.source_config(self.active_source).description()
+            );
+            if let Some(notice) = &self.notice {
+                message.push('\n');
+                message.push_str(notice);
+            }
             painter.text(
                 response.rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!(
-                    "Waiting for video from {}...",
-                    self.config.source_config(self.active_source).description()
-                ),
+                message,
                 egui::FontId::proportional(28.0),
                 Color32::WHITE,
             );
