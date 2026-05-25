@@ -1,5 +1,6 @@
 mod camera;
 mod frame_source;
+mod loopback;
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -18,6 +19,7 @@ use crate::frame_source::{
     FramePacket, RunningFrameSource, V4l2Config, V4l2PixelFormat, VideoSourceConfig,
     decode_frame_packet,
 };
+use crate::loopback::{LoopbackBridge, LoopbackConfig};
 
 fn main() -> Result<()> {
     let config = AppConfig::parse()?;
@@ -30,6 +32,14 @@ fn main() -> Result<()> {
     } else {
         camera.initialize().context("failed to initialize camera")?;
     }
+
+    let loopback_bridge = match &config.loopback_config {
+        Some(loopback_config) => Some(
+            LoopbackBridge::spawn(loopback_config)
+                .context("failed to start loopback ffmpeg bridge")?,
+        ),
+        None => None,
+    };
 
     let initial_source = config.initial_source;
     let initial_source_config = config.source_config(initial_source);
@@ -55,6 +65,7 @@ fn main() -> Result<()> {
         camera,
         initial_source,
         frame_source,
+        loopback_bridge,
         keepalive,
         command_worker,
     );
@@ -85,6 +96,7 @@ struct AppConfig {
     initial_source: SourceKind,
     lumix_udp_port: u16,
     v4l2_config: V4l2Config,
+    loopback_config: Option<LoopbackConfig>,
 }
 
 impl AppConfig {
@@ -97,6 +109,12 @@ impl AppConfig {
         let mut video_size = String::from("1920x1080");
         let mut framerate: u32 = 60;
         let mut input_format = String::from("mjpeg");
+        let mut bridge_loopback = false;
+        let mut bridge_input = String::from("/dev/video0");
+        let mut bridge_webcam_output = String::from("/dev/video10");
+        let mut bridge_preview_output = String::from("/dev/video11");
+        let mut bridge_output_format = String::from("yuv420p");
+        let mut bridge_preview_format = String::from("yu12");
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -138,6 +156,24 @@ impl AppConfig {
                 "--input-format" => {
                     input_format = next_value(&mut args, "--input-format")?;
                 }
+                "--bridge-loopback" => {
+                    bridge_loopback = true;
+                }
+                "--bridge-input" => {
+                    bridge_input = next_value(&mut args, "--bridge-input")?;
+                }
+                "--bridge-webcam-output" => {
+                    bridge_webcam_output = next_value(&mut args, "--bridge-webcam-output")?;
+                }
+                "--bridge-preview-output" => {
+                    bridge_preview_output = next_value(&mut args, "--bridge-preview-output")?;
+                }
+                "--bridge-output-format" => {
+                    bridge_output_format = next_value(&mut args, "--bridge-output-format")?;
+                }
+                "--bridge-preview-format" => {
+                    bridge_preview_format = next_value(&mut args, "--bridge-preview-format")?;
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -146,14 +182,30 @@ impl AppConfig {
             }
         }
 
+        let (width, height) = parse_video_size(&video_size)?;
+        let mut pixel_format = V4l2PixelFormat::parse(&input_format)?;
+        let loopback_config = if bridge_loopback {
+            video_device = bridge_preview_output.clone();
+            source_name = String::from("v4l2");
+            pixel_format = V4l2PixelFormat::parse(&bridge_preview_format)?;
+            Some(LoopbackConfig {
+                input_device: bridge_input,
+                webcam_output: bridge_webcam_output,
+                preview_output: bridge_preview_output,
+                input_format: input_format.clone(),
+                output_format: bridge_output_format,
+                width,
+                height,
+                fps: framerate,
+            })
+        } else {
+            None
+        };
         let initial_source = match source_name.as_str() {
             "lumix-udp" => SourceKind::LumixUdp,
             "v4l2" => SourceKind::V4l2,
             other => bail!("unsupported source `{other}`"),
         };
-
-        let (width, height) = parse_video_size(&video_size)?;
-        let pixel_format = V4l2PixelFormat::parse(&input_format)?;
         let v4l2_config = V4l2Config {
             device: video_device,
             width,
@@ -164,10 +216,11 @@ impl AppConfig {
 
         Ok(Self {
             camera_ip,
-            initial_source,
             wait_camera,
+            initial_source,
             lumix_udp_port,
             v4l2_config,
+            loopback_config,
         })
     }
 
@@ -191,9 +244,9 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  --camera-ip <ip>        Camera IP address (default: 192.168.54.1)");
-    println!("  --source <name>         `lumix-udp` or `v4l2` (default: lumix-udp)");
     println!("  --wait-camera <secs>    Retry camera startup for this many seconds (default: 60)");
     println!("  --no-wait-camera        Start without retrying camera startup");
+    println!("  --source <name>         `lumix-udp` or `v4l2` (default: lumix-udp)");
     println!("  --udp-port <port>       Lumix UDP stream port (default: 49152)");
     println!("  --video-device <path>   V4L2 device path (default: /dev/video2)");
     println!(
@@ -201,6 +254,16 @@ fn print_help() {
     );
     println!("  --video-size <WxH>      V4L2 size (default: 1920x1080)");
     println!("  --framerate <fps>       V4L2 capture rate (default: 60)");
+    println!("  --bridge-loopback       Start ffmpeg and preview from the loopback device");
+    println!("  --bridge-input <path>   ffmpeg input device (default: /dev/video0)");
+    println!("  --bridge-webcam-output <path>");
+    println!("                           Webcam output device (default: /dev/video10)");
+    println!("  --bridge-preview-output <path>");
+    println!("                           Preview output device (default: /dev/video11)");
+    println!("  --bridge-output-format <fmt>");
+    println!("                           ffmpeg output pixel format (default: yuv420p)");
+    println!("  --bridge-preview-format <fmt>");
+    println!("                           V4L2 preview format (default: yu12)");
 }
 
 fn parse_video_size(value: &str) -> Result<(u32, u32)> {
@@ -223,6 +286,7 @@ struct LumixApp {
     lumix_source: Option<RunningFrameSource>,
     v4l2_source: Option<RunningFrameSource>,
     lumix_stream_started: bool,
+    loopback_bridge: Option<LoopbackBridge>,
     keepalive: KeepaliveHandle,
     command_worker: CameraCommandWorker,
     texture: Option<TextureHandle>,
@@ -239,6 +303,7 @@ impl LumixApp {
         camera: Arc<CameraClient>,
         active_source: SourceKind,
         frame_source: RunningFrameSource,
+        loopback_bridge: Option<LoopbackBridge>,
         keepalive: KeepaliveHandle,
         command_worker: CameraCommandWorker,
     ) -> Self {
@@ -254,6 +319,7 @@ impl LumixApp {
             lumix_source,
             v4l2_source,
             lumix_stream_started,
+            loopback_bridge,
             keepalive,
             command_worker,
             texture: None,
@@ -567,6 +633,7 @@ impl Drop for LumixApp {
         }
 
         let _ = &self.keepalive;
+        let _ = &self.loopback_bridge;
         let _ = &self.lumix_source;
         let _ = &self.v4l2_source;
         let _ = &self.command_worker;

@@ -7,7 +7,7 @@ camera control.
 
 Panasonic's official Lumix Tether and Lumix Webcam Software are Windows/macOS
 only. On Linux there is no supported way to get a live video feed from a Lumix
-camera — even though the cameras expose a perfectly usable WiFi streaming
+camera, even though the cameras expose a perfectly usable WiFi streaming
 interface.
 
 LumixCam talks to the camera over its HTTP/CGI control API and receives the
@@ -31,10 +31,45 @@ the fly.
 
 - Linux (Wayland or X11)
 - Rust 2024 edition (1.85+)
+- `ffmpeg` when you want LumixCam to feed V4L2 loopback devices
+- `v4l2loopback` when you want apps such as browsers, OBS, or video chat tools
+  to see the camera as a webcam
 - A Panasonic Lumix camera with WiFi (tested with cameras that expose the
   `cam.cgi` HTTP interface)
 - The camera connected to the same network as the PC (the camera's own WiFi AP
-  works — default IP is `192.168.54.1`)
+  works; default IP is `192.168.54.1`)
+
+## OS loopback setup
+
+Let the OS create the loopback devices during boot. LumixCam checks the devices
+and starts `ffmpeg`, but it does not run `sudo modprobe` from the GUI.
+
+Create this file:
+
+```bash
+sudo tee /etc/modules-load.d/lumix-v4l2loopback.conf >/dev/null <<'EOF'
+v4l2loopback
+EOF
+```
+
+Create this file:
+
+```bash
+sudo tee /etc/modprobe.d/lumix-v4l2loopback.conf >/dev/null <<'EOF'
+options v4l2loopback video_nr=10,11 card_label="Lumix Webcam","Lumix Preview" exclusive_caps=1,1
+EOF
+```
+
+Test the setup without rebooting:
+
+```bash
+sudo modprobe -r v4l2loopback
+sudo modprobe v4l2loopback
+v4l2-ctl --list-devices
+```
+
+You should see `/dev/video10` for `Lumix Webcam` and `/dev/video11` for
+`Lumix Preview`.
 
 ## Build
 
@@ -61,6 +96,9 @@ lumixcam --camera-ip 192.168.1.100 --udp-port 50000
 # V4L2 with specific format
 lumixcam --source v4l2 --video-device /dev/video0 \
     --input-format yuyv --video-size 1280x720 --framerate 30
+
+# Feed two loopback devices with ffmpeg and preview /dev/video11
+lumixcam --bridge-loopback
 ```
 
 ### Options
@@ -76,6 +114,12 @@ lumixcam --source v4l2 --video-device /dev/video0 \
 | `--input-format <fmt>` | `mjpeg` | V4L2 pixel format: `mjpeg`, `yuyv`, `bgr3`, `yu12` |
 | `--video-size <WxH>` | `1920x1080` | V4L2 capture resolution |
 | `--framerate <fps>` | `60` | V4L2 capture frame rate |
+| `--bridge-loopback` | | Start ffmpeg, write `/dev/video10` and `/dev/video11`, and preview `/dev/video11` |
+| `--bridge-input <path>` | `/dev/video0` | ffmpeg input device |
+| `--bridge-webcam-output <path>` | `/dev/video10` | Device other apps should use as a webcam |
+| `--bridge-preview-output <path>` | `/dev/video11` | Device LumixCam reads for its preview |
+| `--bridge-output-format <fmt>` | `yuv420p` | ffmpeg output pixel format |
+| `--bridge-preview-format <fmt>` | `yu12` | V4L2 format LumixCam requests from the preview device |
 
 ### Keyboard shortcuts
 
