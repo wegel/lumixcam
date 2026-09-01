@@ -1,6 +1,7 @@
 mod camera;
 mod frame_source;
 mod loopback;
+mod yuyv_renderer;
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -10,7 +11,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Sender, unbounded};
 use eframe::egui::{
     self, Color32, ColorImage, Key, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
+    mutex::Mutex,
 };
+use eframe::egui_glow;
 
 use crate::camera::{
     AF_AREA_MODES, CameraClient, CameraCommand, CameraState, FOCUS_MODES, KeepaliveHandle,
@@ -20,6 +23,7 @@ use crate::frame_source::{
     decode_frame_packet,
 };
 use crate::loopback::{LoopbackBridge, LoopbackConfig};
+use crate::yuyv_renderer::YuyvRenderer;
 
 fn main() -> Result<()> {
     let config = AppConfig::parse()?;
@@ -60,17 +64,24 @@ fn main() -> Result<()> {
     };
 
     let title = format!("LumixCam ({})", initial_source_config.description());
-    let app = LumixApp::new(
-        config,
-        camera,
-        initial_source,
-        frame_source,
-        loopback_bridge,
-        keepalive,
-        command_worker,
-    );
-    eframe::run_native(&title, options, Box::new(move |_| Ok(Box::new(app))))
-        .map_err(|err| anyhow!("failed to launch egui window: {err}"))?;
+    eframe::run_native(
+        &title,
+        options,
+        Box::new(move |creation_context| {
+            let startup = AppStartup {
+                config,
+                camera,
+                active_source: initial_source,
+                frame_source,
+                loopback_bridge,
+                keepalive,
+                command_worker,
+            };
+            let app = LumixApp::new(creation_context, startup)?;
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|err| anyhow!("failed to launch egui window: {err}"))?;
     Ok(())
 }
 
@@ -295,7 +306,8 @@ struct LumixApp {
     loopback_bridge: Option<LoopbackBridge>,
     keepalive: KeepaliveHandle,
     command_worker: CameraCommandWorker,
-    texture: Option<TextureHandle>,
+    preview: Option<Preview>,
+    yuyv_renderer: Arc<Mutex<YuyvRenderer>>,
     focus_mode_idx: usize,
     af_area_idx: usize,
     camera_state: CameraState,
@@ -303,22 +315,43 @@ struct LumixApp {
     notice: Option<String>,
 }
 
+enum Preview {
+    Texture(TextureHandle),
+    Yuyv { width: usize, height: usize },
+}
+
+struct AppStartup {
+    config: AppConfig,
+    camera: Arc<CameraClient>,
+    active_source: SourceKind,
+    frame_source: RunningFrameSource,
+    loopback_bridge: Option<LoopbackBridge>,
+    keepalive: KeepaliveHandle,
+    command_worker: CameraCommandWorker,
+}
+
 impl LumixApp {
-    fn new(
-        config: AppConfig,
-        camera: Arc<CameraClient>,
-        active_source: SourceKind,
-        frame_source: RunningFrameSource,
-        loopback_bridge: Option<LoopbackBridge>,
-        keepalive: KeepaliveHandle,
-        command_worker: CameraCommandWorker,
-    ) -> Self {
+    fn new(creation_context: &eframe::CreationContext<'_>, startup: AppStartup) -> Result<Self> {
+        let AppStartup {
+            config,
+            camera,
+            active_source,
+            frame_source,
+            loopback_bridge,
+            keepalive,
+            command_worker,
+        } = startup;
         let (lumix_source, v4l2_source, lumix_stream_started) = match active_source {
             SourceKind::LumixUdp => (Some(frame_source), None, true),
             SourceKind::V4l2 => (None, Some(frame_source), false),
         };
+        let gl = creation_context
+            .gl
+            .as_deref()
+            .ok_or_else(|| anyhow!("OpenGL is unavailable for the YUYV preview"))?;
+        let yuyv_renderer = Arc::new(Mutex::new(YuyvRenderer::new(gl)?));
 
-        Self {
+        Ok(Self {
             config,
             camera,
             active_source,
@@ -328,16 +361,17 @@ impl LumixApp {
             loopback_bridge,
             keepalive,
             command_worker,
-            texture: None,
+            preview: None,
+            yuyv_renderer,
             focus_mode_idx: 0,
             af_area_idx: 0,
             camera_state: CameraState::default(),
             focus_uv: None,
             notice: Some(format!("active source: {}", active_source.label())),
-        }
+        })
     }
 
-    fn update_texture(&mut self, ctx: &egui::Context) {
+    fn update_preview(&mut self, ctx: &egui::Context) {
         let mut newest: Option<FramePacket> = None;
         let Some(frame_source) = self.active_frame_source() else {
             return;
@@ -358,6 +392,21 @@ impl LumixApp {
         let Some(packet) = newest else {
             return;
         };
+        if let FramePacket::Yuyv {
+            width,
+            height,
+            bytes,
+        } = packet
+        {
+            if let Err(err) = self.yuyv_renderer.lock().set_frame(width, height, bytes) {
+                self.notice = Some(format!("video decode error: {err:#}"));
+                return;
+            }
+            self.preview = Some(Preview::Yuyv { width, height });
+            self.clear_video_notice();
+            return;
+        }
+
         let frame = match decode_frame_packet(packet) {
             Ok(frame) => frame,
             Err(err) => {
@@ -366,20 +415,28 @@ impl LumixApp {
             }
         };
 
+        self.clear_video_notice();
+
+        let image = ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
+        match &mut self.preview {
+            Some(Preview::Texture(texture)) => texture.set(image, TextureOptions::LINEAR),
+            _ => {
+                self.preview = Some(Preview::Texture(ctx.load_texture(
+                    "lumix-frame",
+                    image,
+                    TextureOptions::LINEAR,
+                )));
+            }
+        }
+    }
+
+    fn clear_video_notice(&mut self) {
         if self
             .notice
             .as_deref()
             .is_some_and(|notice| notice.starts_with("video "))
         {
             self.notice = None;
-        }
-
-        let image = ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
-        match &mut self.texture {
-            Some(texture) => texture.set(image, TextureOptions::LINEAR),
-            None => {
-                self.texture = Some(ctx.load_texture("lumix-frame", image, TextureOptions::LINEAR));
-            }
         }
     }
 
@@ -441,7 +498,7 @@ impl LumixApp {
 
         let previous_source = self.active_source;
         self.active_source = source;
-        self.texture = None;
+        self.preview = None;
         self.focus_uv = None;
         self.notice = Some(format!(
             "switched from {} to {}",
@@ -502,15 +559,32 @@ impl LumixApp {
         let (response, painter) = ui.allocate_painter(available, Sense::click());
         let status_text = self.status_text();
 
-        if let Some(texture) = &self.texture {
-            let texture_size = texture.size_vec2();
+        if let Some(preview) = &self.preview {
+            let texture_size = match preview {
+                Preview::Texture(texture) => texture.size_vec2(),
+                Preview::Yuyv { width, height } => Vec2::new(*width as f32, *height as f32),
+            };
             let image_rect = fitted_rect(response.rect, texture_size);
-            painter.image(
-                texture.id(),
-                image_rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            match preview {
+                Preview::Texture(texture) => {
+                    painter.image(
+                        texture.id(),
+                        image_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+                Preview::Yuyv { .. } => {
+                    let renderer = Arc::clone(&self.yuyv_renderer);
+                    let callback = egui_glow::CallbackFn::new(move |_info, painter| {
+                        renderer.lock().paint(painter.gl());
+                    });
+                    painter.add(egui::PaintCallback {
+                        rect: image_rect,
+                        callback: Arc::new(callback),
+                    });
+                }
+            }
 
             if response.clicked_by(egui::PointerButton::Primary) {
                 if let Some(pos) = response.interact_pointer_pos() {
@@ -619,7 +693,7 @@ impl LumixApp {
 impl eframe::App for LumixApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_camera_state();
-        self.update_texture(ctx);
+        self.update_preview(ctx);
         self.handle_keys(ctx);
         self.draw_source_selector(ctx);
 
@@ -629,6 +703,12 @@ impl eframe::App for LumixApp {
 
         ctx.request_repaint_after(Duration::from_millis(16));
         let _ = frame;
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let Some(gl) = gl {
+            self.yuyv_renderer.lock().destroy(gl);
+        }
     }
 }
 
