@@ -15,6 +15,7 @@ pub struct LoopbackConfig {
     pub preview_output: String,
     pub input_format: String,
     pub output_format: String,
+    pub copy_input: bool,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -30,38 +31,9 @@ impl LoopbackBridge {
         check_output_device(&config.preview_output)?;
         let ffmpeg = find_ffmpeg().context("failed to find ffmpeg in PATH")?;
 
-        let video_size = format!("{}x{}", config.width, config.height);
+        let args = ffmpeg_args(config);
         let mut child = Command::new(ffmpeg)
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-f")
-            .arg("v4l2")
-            .arg("-input_format")
-            .arg(&config.input_format)
-            .arg("-video_size")
-            .arg(video_size)
-            .arg("-framerate")
-            .arg(config.fps.to_string())
-            .arg("-i")
-            .arg(&config.input_device)
-            .arg("-map")
-            .arg("0:v")
-            .arg("-vcodec")
-            .arg("rawvideo")
-            .arg("-pix_fmt")
-            .arg(&config.output_format)
-            .arg("-f")
-            .arg("v4l2")
-            .arg(&config.webcam_output)
-            .arg("-map")
-            .arg("0:v")
-            .arg("-vcodec")
-            .arg("rawvideo")
-            .arg("-pix_fmt")
-            .arg(&config.output_format)
-            .arg("-f")
-            .arg("v4l2")
-            .arg(&config.preview_output)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -80,6 +52,68 @@ impl LoopbackBridge {
 
         Ok(Self { child })
     }
+}
+
+fn ffmpeg_args(config: &LoopbackConfig) -> Vec<String> {
+    let mut args = vec![
+        String::from("-loglevel"),
+        String::from("error"),
+        String::from("-f"),
+        String::from("v4l2"),
+        String::from("-input_format"),
+        ffmpeg_input_format(&config.input_format).to_owned(),
+        String::from("-video_size"),
+        format!("{}x{}", config.width, config.height),
+        String::from("-framerate"),
+        config.fps.to_string(),
+        String::from("-i"),
+        config.input_device.clone(),
+    ];
+
+    if config.copy_input {
+        push_copy_output(&mut args, &config.webcam_output);
+        push_copy_output(&mut args, &config.preview_output);
+    } else {
+        push_raw_output(&mut args, &config.webcam_output, &config.output_format);
+        push_raw_output(&mut args, &config.preview_output, &config.output_format);
+    }
+
+    args
+}
+
+fn ffmpeg_input_format(input_format: &str) -> &str {
+    match input_format {
+        "yuyv" => "yuyv422",
+        "bgr3" => "bgr24",
+        "yu12" => "yuv420p",
+        other => other,
+    }
+}
+
+fn push_copy_output(args: &mut Vec<String>, output: &str) {
+    args.extend([
+        String::from("-map"),
+        String::from("0:v"),
+        String::from("-c:v"),
+        String::from("copy"),
+        String::from("-f"),
+        String::from("v4l2"),
+        output.to_owned(),
+    ]);
+}
+
+fn push_raw_output(args: &mut Vec<String>, output: &str, output_format: &str) {
+    args.extend([
+        String::from("-map"),
+        String::from("0:v"),
+        String::from("-c:v"),
+        String::from("rawvideo"),
+        String::from("-pix_fmt"),
+        output_format.to_owned(),
+        String::from("-f"),
+        String::from("v4l2"),
+        output.to_owned(),
+    ]);
 }
 
 impl Drop for LoopbackBridge {
@@ -139,4 +173,75 @@ fn find_ffmpeg() -> Option<PathBuf> {
     env::split_paths(&path)
         .map(|entry| entry.join("ffmpeg"))
         .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LoopbackConfig, ffmpeg_args};
+
+    fn test_config(copy_input: bool) -> LoopbackConfig {
+        LoopbackConfig {
+            input_device: String::from("/dev/video0"),
+            webcam_output: String::from("/dev/video10"),
+            preview_output: String::from("/dev/video11"),
+            input_format: String::from("yuyv"),
+            output_format: String::from("yuv420p"),
+            copy_input,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+        }
+    }
+
+    #[test]
+    fn yuyv_copy_keeps_input_packets_unchanged() {
+        let args = ffmpeg_args(&test_config(true));
+
+        assert_eq!(
+            args,
+            [
+                "-loglevel",
+                "error",
+                "-f",
+                "v4l2",
+                "-input_format",
+                "yuyv422",
+                "-video_size",
+                "1920x1080",
+                "-framerate",
+                "60",
+                "-i",
+                "/dev/video0",
+                "-map",
+                "0:v",
+                "-c:v",
+                "copy",
+                "-f",
+                "v4l2",
+                "/dev/video10",
+                "-map",
+                "0:v",
+                "-c:v",
+                "copy",
+                "-f",
+                "v4l2",
+                "/dev/video11",
+            ]
+        );
+    }
+
+    #[test]
+    fn converted_output_keeps_the_requested_pixel_format() {
+        let args = ffmpeg_args(&test_config(false));
+
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "rawvideo").count(),
+            2
+        );
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "yuv420p").count(),
+            2
+        );
+        assert!(!args.iter().any(|arg| arg == "copy"));
+    }
 }

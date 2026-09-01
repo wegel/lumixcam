@@ -99,6 +99,10 @@ lumixcam --source v4l2 --video-device /dev/video0 \
 
 # Feed two loopback devices with ffmpeg and preview /dev/video11
 lumixcam --bridge-loopback
+
+# Copy raw YUYV frames to both loopback devices without conversion
+lumixcam --bridge-loopback --input-format yuyv --bridge-copy-input \
+    --bridge-preview-format yuyv
 ```
 
 ### Options
@@ -120,6 +124,7 @@ lumixcam --bridge-loopback
 | `--bridge-preview-output <path>` | `/dev/video11` | Device LumixCam reads for its preview |
 | `--bridge-output-format <fmt>` | `yuv420p` | ffmpeg output pixel format |
 | `--bridge-preview-format <fmt>` | `yu12` | V4L2 format LumixCam requests from the preview device |
+| `--bridge-copy-input` | | Copy input frames to both loopback devices without decoding or changing their pixel layout |
 
 ### Keyboard shortcuts
 

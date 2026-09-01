@@ -115,6 +115,7 @@ impl AppConfig {
         let mut bridge_preview_output = String::from("/dev/video11");
         let mut bridge_output_format = String::from("yuv420p");
         let mut bridge_preview_format = String::from("yu12");
+        let mut bridge_copy_input = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -174,6 +175,9 @@ impl AppConfig {
                 "--bridge-preview-format" => {
                     bridge_preview_format = next_value(&mut args, "--bridge-preview-format")?;
                 }
+                "--bridge-copy-input" => {
+                    bridge_copy_input = true;
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -194,6 +198,7 @@ impl AppConfig {
                 preview_output: bridge_preview_output,
                 input_format: input_format.clone(),
                 output_format: bridge_output_format,
+                copy_input: bridge_copy_input,
                 width,
                 height,
                 fps: framerate,
@@ -264,6 +269,7 @@ fn print_help() {
     println!("                           ffmpeg output pixel format (default: yuv420p)");
     println!("  --bridge-preview-format <fmt>");
     println!("                           V4L2 preview format (default: yu12)");
+    println!("  --bridge-copy-input      Copy input frames without decoding or conversion");
 }
 
 fn parse_video_size(value: &str) -> Result<(u32, u32)> {
